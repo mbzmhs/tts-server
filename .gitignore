@@ -1,0 +1,41 @@
+# 引擎（GPT-SoVITS / 整合包）：体积大且按显卡型号由用户自行下载
+# Windows 整合包解压为 engine/（含 engine/runtime/python.exe 与 engine/GPT_SoVITS/）
+# Linux 直接 clone GPT-SoVITS 到 engine/
+engine/
+
+# 自定义训练音色权重（*.ckpt / *.pth），不入库
+GPT_weights_v4/*.ckpt
+GPT_weights_v4/*.pth
+SoVITS_weights_v4/*.ckpt
+SoVITS_weights_v4/*.pth
+
+# 自定义音色参考音频（保留内置 default 音色的参考音频）
+ref/*
+!ref/default/
+!ref/default/**
+
+# 训练 / 对照音频输出
+check/
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# 运行时与临时文件
+*.log
+*.tmp
+*.temp
+nohup.out
+
+# 系统 / 编辑器
+.DS_Store
+Thumbs.db
+Desktop.ini
+desktop.ini
+.idea/
+.vscode/
+*.swp

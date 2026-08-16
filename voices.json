@@ -1,0 +1,44 @@
+{
+  "version": "1.0",
+  "active_voice": "default",
+  "voices": {
+    "default": {
+      "name": "内置预训练音色（零样本，无需训练）",
+      "engine": "v4",
+      "gpt_path": "engine/GPT_SoVITS/pretrained_models/s1v3.ckpt",
+      "sovits_path": "engine/GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth",
+      "emotions": {
+        "neutral": {
+          "wav": "ref/default/neutral.wav",
+          "text": "今天天气真不错，我们一起出去走走吧。",
+          "lang": "zh"
+        },
+        "happy": {
+          "wav": "ref/default/happy.wav",
+          "text": "太棒了，今天真是令人开心的一天啊！",
+          "lang": "zh"
+        },
+        "sad": {
+          "wav": "ref/default/sad.wav",
+          "text": "今天有点难过，心情不是很好。",
+          "lang": "zh"
+        },
+        "angry": {
+          "wav": "ref/default/angry.wav",
+          "text": "这件事实在太过分了，我真的非常生气！",
+          "lang": "zh"
+        },
+        "surprised": {
+          "wav": "ref/default/surprised.wav",
+          "text": "天哪，这真的太让人惊讶了，完全没想到！",
+          "lang": "zh"
+        },
+        "afraid": {
+          "wav": "ref/default/afraid.wav",
+          "text": "那里好黑，我好害怕，不敢一个人过去。",
+          "lang": "zh"
+        }
+      }
+    } 
+  }
+}

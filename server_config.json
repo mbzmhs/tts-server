@@ -1,0 +1,8 @@
+{
+  "host": "127.0.0.1",
+  "port": 9880,
+  "device": "auto",
+  "default_emotion": "neutral",
+  "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
+  "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base"
+}
