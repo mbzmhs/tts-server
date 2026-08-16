@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # TTS 本地服务启动脚本（Linux/macOS；Windows 用 start.bat）
 # 自动检测 GPU/CPU，自动定位 Python 运行时
+# 缺失 engine/ 时交互引导 git clone 安装（可选用 HTTP 代理）
 # 用法:  ./start.sh                 启动服务（默认 127.0.0.1:9880）
 #        ./start.sh -p 9881         指定端口
 #        ./start.sh --device cpu    强制 CPU
@@ -11,15 +12,45 @@ echo "============================================================"
 echo " TTS Local Server (GPT-SoVITS V4)"
 echo "============================================================"
 
-# 1) engine 必须存在（按显卡型号自行下载解压/clone 到 engine/）
+# 1) engine 必须存在；缺失时交互引导克隆安装
 if [ ! -d "engine/GPT_SoVITS" ]; then
-  echo "[TTS] ERROR: engine/GPT_SoVITS not found."
-  echo "       请先按显卡型号下载 GPT-SoVITS 引擎放到本目录的 engine/:"
-  echo "         - Windows: 官方整合包整体解压为 engine/（含 engine/runtime/python.exe）"
-  echo "         - Linux  : git clone https://github.com/RVC-Boss/GPT-SoVITS engine"
-  echo "         RTX 50 系显卡下载 ...-nvidia50 版本（CUDA 12.8），其余用标准版（CUDA 12.4）。"
-  echo "       详见 README.md 的「安装引擎」一节。"
-  exit 1
+  echo "[TTS] 未找到引擎: engine/GPT_SoVITS"
+  echo "       Linux 通过 git clone 官方仓库安装（约 1~2GB）。"
+  echo "       （Windows 请使用 start.bat，会按显卡型号下载整合包；RTX 50 系用"
+  echo "         -nvidia50/CUDA 12.8 版，其余用标准版/CUDA 12.4，见 README.md）"
+  printf "是否现在克隆引擎？[y/N] "
+  read -r ans
+  case "$ans" in
+    y|Y|yes|YES)
+      printf "是否使用 HTTP 代理 http://127.0.0.1:10809 克隆？[y/N] "
+      read -r p_ans
+      case "$p_ans" in
+        y|Y)
+          echo "[TTS] 使用代理克隆 ..."
+          git -c http.proxy=http://127.0.0.1:10809 \
+            -c https.proxy=http://127.0.0.1:10809 \
+            clone https://github.com/RVC-Boss/GPT-SoVITS engine
+          ;;
+        *)
+          echo "[TTS] 直连克隆 ..."
+          git clone https://github.com/RVC-Boss/GPT-SoVITS engine
+          ;;
+      esac
+      if [ ! -d "engine/GPT_SoVITS" ]; then
+        echo "[TTS] 克隆失败。请检查网络后重试，或手动 git clone 到 engine/。"
+        exit 1
+      fi
+      echo "[TTS] 引擎已克隆到 engine/。"
+      echo "       请安装 Python 依赖后再运行本脚本，例如："
+      echo "         conda create -n gptsovits python=3.9 -y && conda activate gptsovits"
+      echo "         pip install -r engine/requirements.txt"
+      exit 0
+      ;;
+    *)
+      echo "[TTS] 已取消。请手动 git clone https://github.com/RVC-Boss/GPT-SoVITS engine 后重试。"
+      exit 1
+      ;;
+  esac
 fi
 
 # 2) 定位带 numpy/torch/fastapi 的 Python（优先引擎自带 runtime，其次 conda 环境，最后系统 python）
