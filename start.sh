@@ -22,20 +22,17 @@ if [ ! -d "engine/GPT_SoVITS" ]; then
   read -r ans
   case "$ans" in
     y|Y|yes|YES)
-      printf "是否使用 HTTP 代理 http://127.0.0.1:10809 克隆？[y/N] "
-      read -r p_ans
-      case "$p_ans" in
-        y|Y)
-          echo "[TTS] 使用代理克隆 ..."
-          git -c http.proxy=http://127.0.0.1:10809 \
-            -c https.proxy=http://127.0.0.1:10809 \
-            clone https://github.com/RVC-Boss/GPT-SoVITS engine
-          ;;
-        *)
-          echo "[TTS] 直连克隆 ..."
-          git clone https://github.com/RVC-Boss/GPT-SoVITS engine
-          ;;
-      esac
+      printf "HTTP 代理（如 http://host:port，直接回车则直连）: "
+      read -r proxy
+      if [ -n "$proxy" ]; then
+        echo "[TTS] 使用代理 $proxy 克隆 ..."
+        git -c http.proxy="$proxy" \
+          -c https.proxy="$proxy" \
+          clone https://github.com/RVC-Boss/GPT-SoVITS engine
+      else
+        echo "[TTS] 直连克隆 ..."
+        git clone https://github.com/RVC-Boss/GPT-SoVITS engine
+      fi
       if [ ! -d "engine/GPT_SoVITS" ]; then
         echo "[TTS] 克隆失败。请检查网络后重试，或手动 git clone 到 engine/。"
         exit 1

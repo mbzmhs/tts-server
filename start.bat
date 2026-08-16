@@ -49,11 +49,12 @@ choice /c 12 /m "Download source [1] HuggingFace [2] ModelScope (CN)"
 set "SRC=ms"
 if not errorlevel 2 set "SRC=hf"
 
-rem ---- 3) use HTTP proxy? ----
+rem ---- 3) HTTP proxy (optional, custom value) ----
 echo.
-choice /c YN /m "Use HTTP proxy http://127.0.0.1:10809 for download?"
 set "CURLPROXY="
-if not errorlevel 2 set "CURLPROXY=-x http://127.0.0.1:10809"
+set /p "CURLPROXYURL=HTTP proxy (http://host:port) or press Enter for none: "
+if not defined CURLPROXYURL set "CURLPROXYURL="
+if defined CURLPROXYURL set "CURLPROXY=-x %CURLPROXYURL%"
 
 set "BASENAME=GPT-SoVITS-v4-20250529%GPUVER%"
 if "%SRC%"=="hf" set "URL=https://huggingface.co/lj1995/GPT-SoVITS-windows-package/resolve/main/%BASENAME%.7z?download=true"

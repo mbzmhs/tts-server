@@ -33,7 +33,7 @@ tts-server/
 本项目不包含任何模型文件。首次使用需先安装 GPT-SoVITS V4 引擎（含预训练底模），
 解压 / clone 到项目根目录下的 `engine/` 即可；服务自动定位，**不修改引擎任何文件**。
 引擎缺失时 `start.bat` / `start.sh` 会**交互式引导下载**（`start.bat` 会先问显卡
-型号、下载源、是否走 HTTP 代理 `http://127.0.0.1:10809`，然后自动下载并尝试解压
+型号、下载源、是否走 HTTP 代理（可手动输入代理地址，或回车直连），然后自动下载并尝试解压
 重命名为 `engine`）。
 
 **Windows**（推荐官方整合包，自带 `engine\runtime\python.exe`，无独立 Python 也能跑）：
