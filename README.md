@@ -70,12 +70,12 @@ pip install -r requirements.txt    # 或按官方文档用 conda 建环境
 |------|------|------|
 | `host` | `127.0.0.1` | 监听地址 |
 | `port` | `9880` | 监听端口 |
-| `device` | `auto` | `auto`（有 CUDA 用 GPU）/ `cuda` / `cpu` |
+| `device` | `auto` | `auto`（有 CUDA 用 GPU）/ `cuda`；无 GPU 时拒绝启动 |
 | `default_emotion` | `neutral` | 请求未指定情绪时的默认情绪名称 |
 | `bert_base_path` | `GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large` | 语义 BERT 底模 |
 | `cnhuhbert_base_path` | `GPT_SoVITS/pretrained_models/chinese-hubert-base` | 语音特征 HuBERT 底模 |
 
-命令行参数优先级高于配置文件（如 `start.bat -p 9881`、`--device cpu`）。
+命令行参数优先级高于配置文件（如 `start.bat -p 9881`、`--device cuda`）。
 音色与情绪参考（模型路径 / 参考 wav / 参考文本）在 `voices.json` 中编辑。
 
 ### 情绪配置
@@ -94,21 +94,22 @@ default_emotion > 该音色定义的第一个情绪
 
 ## 启动
 
-Windows（整合包放于 `engine/`，自带 `engine\runtime\python.exe`，无卡也能用）：
+Windows（整合包放于 `engine/`，自带 `engine\runtime\python.exe`）：
 
 ```
-start.bat                  # 自动检测 GPU/CPU，监听 127.0.0.1:9880
+start.bat                  # 自动检测 GPU，监听 127.0.0.1:9880
 start.bat -p 9881          # 指定端口
-start.bat --device cpu     # 强制 CPU
+start.bat --device cuda    # 强制 CUDA
 ```
 
 Linux/macOS：
 
 ```
-./start.sh [--device cpu] [-p 9881]
+./start.sh [--device cuda] [-p 9881]
 ```
 
-服务启动时自动检测 CUDA：有 GPU 用 fp16（快），无 GPU 回退 CPU（慢但可用）。
+服务仅在 GPU 上运行：启动时自动检测 CUDA，无可用 NVIDIA GPU 时直接拒绝启动
+（CPU 合成速度无法支持实时使用，也不满足中断后快速结束的要求）。
 
 ## API
 

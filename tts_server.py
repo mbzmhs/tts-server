@@ -172,7 +172,7 @@ DEFAULT_REQ = {
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 9880,
-    "device": "auto",   # auto / cuda / cpu
+    "device": "auto",   # auto / cuda（无 GPU 时拒绝启动）
     "default_emotion": "neutral",
     "bert_base_path": "GPT_SoVITS/pretrained_models/chinese-roberta-wwm-ext-large",
     "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
@@ -210,6 +210,29 @@ def _sanitize_text(text: str) -> str:
         else:
             out.append(ch)
     return "".join(out)
+
+
+async def _is_disconnected(request: Request) -> bool:
+    """检测客户端是否断开。外层 wait_for 兼容旧版 Starlette（is_disconnected
+    无内部超时、无消息时会一直阻塞）与新版（自带极短超时）。"""
+    try:
+        return await asyncio.wait_for(request.is_disconnected(), timeout=0.1)
+    except asyncio.TimeoutError:
+        return False
+
+
+async def _aq_or_disconnect(q: asyncio.Queue, request: Request):
+    """等待队列下一项；客户端断开则返回 (True, None)，否则 (False, item)。"""
+    get_task = asyncio.create_task(q.get())
+    while True:
+        if await _is_disconnected(request):
+            get_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await get_task
+            return True, None
+        done, _ = await asyncio.wait({get_task}, timeout=0.5)
+        if done:
+            return False, get_task.result()
 
 # ----------------------------------------------------------------------------
 # 音频打包
@@ -768,7 +791,13 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                             active["streams"].pop(rid, None)
 
                 threading.Thread(target=producer, daemon=True).start()
-                first = await aq.get()
+                disconnected, first = await _aq_or_disconnect(aq, request)
+                if disconnected:
+                    # 首块到达前客户端断开：停止合成，避免孤儿请求继续占 GPU
+                    print(f"[tts] 客户端断开，取消流式合成 ({voice_id}/{emotion})")
+                    backend.cancel_instance(inst)
+                    return Response(content=b"", status_code=499,
+                                    media_type=MEDIA_MIME[req.media_type])
                 if first is None:
                     return Response(content=b"", media_type=MEDIA_MIME[req.media_type])
                 if isinstance(first, Exception):
@@ -783,7 +812,9 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                     try:
                         yield chunk0
                         while True:
-                            item = await aq.get()
+                            disconnected, item = await _aq_or_disconnect(aq, request)
+                            if disconnected:
+                                break
                             if item is None or isinstance(item, Exception):
                                 break
                             yield item[1]
@@ -805,7 +836,7 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                     done, _ = await asyncio.wait({task}, timeout=0.5)
                     if done:
                         break
-                    if await request.is_disconnected():
+                    if await _is_disconnected(request):
                         # 客户端断开：句级取消合成，避免孤儿请求继续占 GPU
                         print(f"[tts] 客户端断开，取消合成 ({voice_id}/{emotion})")
                         backend.cancel_instance(inst)
@@ -879,12 +910,21 @@ def main():
     parser.add_argument("--voices", type=str, default=str(PROJECT_ROOT / "voices.json"))
     parser.add_argument("--initial-voice", type=str, default=None)
     parser.add_argument("--device", type=str, default=None,
-                        help="auto / cuda / cpu（默认取 server_config.json，再取 auto）")
+                        help="auto / cuda（默认取 server_config.json，再取 auto；无 GPU 时拒绝启动）")
     args = parser.parse_args()
 
     host = args.host or cfg.get("host") or DEFAULT_CONFIG["host"]
     port = int(args.port or cfg.get("port") or DEFAULT_CONFIG["port"])
     device = args.device or cfg.get("device") or DEFAULT_CONFIG["device"]
+
+    # 无 GPU 直接拒绝启动：CPU 合成速度不可接受（快速结束的前提就是有 GPU 实时合成）
+    if not torch.cuda.is_available() or device == "cpu":
+        print("=" * 60)
+        print("[tts] 未检测到可用的 NVIDIA GPU（CUDA），拒绝启动。")
+        print("      GPT-SoVITS 的 CPU 合成速度无法支持实时使用，本服务仅在 GPU 上运行。")
+        print("      请确认 NVIDIA 显卡驱动 / CUDA 环境正常后重试。")
+        print("=" * 60)
+        sys.exit(1)
 
     registry = VoiceRegistry(args.voices)
     backend = TTSBackend(registry, args.initial_voice, device=device,
