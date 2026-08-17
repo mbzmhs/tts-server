@@ -29,6 +29,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -192,17 +193,30 @@ def load_server_config() -> dict:
         return {}
 
 
+# 不可朗读的字符类别：So（符号，含绝大多数 emoji）、Cf（格式控制，含 ZWJ/BOM/零宽）、
+# Co（私用区）、Cs（代理区）、Me（围合标记，如 keycap 序列）。这些字符引擎清洗后
+# 可能整段变空，导致 torch.cat 空列表崩溃，直接剥离（不朗读）。
+_UNSPEAKABLE_CATS = frozenset({"So", "Cf", "Co", "Cs", "Me"})
+# 变体选择符（FE00-FE0F，类别 Mn）跟随 emoji 指定显示形式、围合键帽符（20E3），一并剥离
+_UNSPEAKABLE_RE = re.compile("[\U0000FE00-\U0000FE0F\u20E3]+")
+
+
 def _sanitize_text(text: str) -> str:
     """归一化引擎无法处理的字符，防止个别符号导致合成崩溃。
 
-    引擎 zh_normalization 只认识部分文字系统的数字（DIGITS 表不含泰文数字等），
-    遇到生僻数字会抛 KeyError。这里把「所有 Unicode 十进制数字」（Nd 类，
-    如泰文 ๑、阿拉伯-印度数字 ٥）统一转成 ASCII 数字——语义完全等价。
-    其余字符原样保留。
+    1) 剥离 emoji / 符号 / 格式控制 / 私用区字符（类别 So/Cf/Co/Cs 及变体选择符、
+       围合键帽符）——这类字符引擎无法朗读，清洗后可能整段变空而崩溃；
+    2) 引擎 zh_normalization 只认识部分文字系统的数字（DIGITS 表不含泰文数字等），
+       遇到生僻数字会抛 KeyError。这里把「所有 Unicode 十进制数字」（Nd 类，
+       如泰文 ๑、阿拉伯-印度数字 ٥）统一转成 ASCII 数字——语义完全等价。
     """
+    text = _UNSPEAKABLE_RE.sub("", text)
     out = []
     for ch in text:
-        if unicodedata.category(ch) == "Nd":
+        cat = unicodedata.category(ch)
+        if cat in _UNSPEAKABLE_CATS:
+            continue
+        if cat == "Nd":
             try:
                 out.append(str(unicodedata.digit(ch)))
             except ValueError:
