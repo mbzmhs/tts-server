@@ -3,11 +3,16 @@
 TTS 本地服务（基于 GPT-SoVITS V4）
 ==================================
 - 自动选择 GPU / CPU 推理（启动时检测 CUDA）
-- 多音色管理：注册 / 列出 / 切换（模型热加载）
+- 多音色管理：注册 / 列出 / 切换（按音色懒加载引擎实例）
 - 每音色可配置任意数量情绪（名称自定，如 neutral / happy / sad / ...），
   情绪通过「参考音频」迁移实现（V3/V4 情绪表达能力最佳）；
   情绪从 voices.json 初始载入，请求未指定时用默认情绪
   （优先级：请求参数 > 音色 default_emotion > server_config default_emotion > 该音色第一个情绪）
+- **并发**：流式与非流式请求各自持有一个轻量引擎实例（共享同一音色的权重模型，
+  各自独立的 prompt_cache / stop_flag），任意请求（不同音色 / 不同情绪 / 相同情绪）
+  均可并行合成，不再有 FIFO 队列。
+- `stop_prev`：新请求带 `stop_prev=true` 时，终止所有在途的流式请求（句级抢占，
+  当前句播完后返回）；false（默认）则完全不打断，全部并发。
 - HTTP 接口返回音频（wav / ogg / raw / aac）
 
 启动:
@@ -15,14 +20,13 @@ TTS 本地服务（基于 GPT-SoVITS V4）
 接口:
     GET  /health                  探针（含设备信息）
     GET  /voices                  列出音色 + 各自情绪 + 当前激活音色
-    POST /voices                  注册 / 更新音色
-    DELETE /voices/{voice_id}     删除音色
-    POST /voices/{voice_id}/activate  切换激活音色（加载模型）
+    POST /voices/{voice_id}/activate  激活音色（校验 + 预热）
     POST /tts                     合成语音，返回音频流
 """
 
 import argparse
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -33,8 +37,68 @@ import traceback
 import unicodedata
 from io import BytesIO
 from pathlib import Path
-from queue import Queue
 from typing import Optional, Union
+
+# 关闭引擎的 tqdm 进度条输出：Windows 控制台在窗口最小化 / 被遮挡时渲染跟不上，
+# 高频刷新的进度条写入会阻塞线程，导致 GPU 空转、合成变慢。本环境 tqdm 4.70 的
+# disable 参数默认是 False（非 None），TQDM_DISABLE 环境变量会被忽略，因此用子类
+# 强制 disable=True；须在引擎 import 之前完成（引擎各处均为 from tqdm import tqdm，
+# 且 pytorch_lightning 会继承 tqdm.tqdm，故必须是类而非函数）。
+import tqdm as _tqdm
+
+
+class _SilentTqdm(_tqdm.tqdm):
+    def __init__(self, *args, **kwargs):
+        kwargs["disable"] = True
+        super().__init__(*args, **kwargs)
+
+
+_tqdm.tqdm = _SilentTqdm
+
+
+class _SilentStdout:
+    """线程感知的 stdout 包装：调用 mute() 后，仅丢弃当前线程的 write。
+
+    引擎在合成/加载时向 stdout 打印大量诊断（切分文本、BERT 特征、解码进度、
+    合成用时等），这些对用户是噪音；但错误 traceback 走 stderr，不受影响。
+    多个并发请求各自在独立线程合成，用 thread-local 标记即可互不干扰地静音。
+    """
+
+    def __init__(self):
+        self._real = sys.stdout
+        self._local = threading.local()
+
+    def _muted(self) -> bool:
+        return bool(getattr(self._local, "muted", False))
+
+    def mute(self):
+        self._local.muted = True
+
+    def unmute(self):
+        self._local.muted = False
+
+    def write(self, s):
+        if not self._muted():
+            self._real.write(s)
+
+    def flush(self):
+        try:
+            self._real.flush()
+        except Exception:
+            pass
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@contextlib.contextmanager
+def _silence_engine():
+    """在当前线程静音引擎 stdout 噪音（加载/合成期间的 print），退出后恢复。"""
+    sys.stdout.mute()
+    try:
+        yield
+    finally:
+        sys.stdout.unmute()
 
 # ----------------------------------------------------------------------------
 # 定位引擎目录（包含 GPT_SoVITS 的目录）并把它加入 sys.path
@@ -82,6 +146,8 @@ MEDIA_TYPES = ["wav", "ogg", "raw", "aac"]
 LANGUAGES = ["auto", "auto_yue", "zh", "ja", "en", "yue", "ko",
              "all_zh", "all_ja", "all_yue", "all_ko"]
 
+# parallel_infer 恒为 True：保证所有并发请求在共享的 t2s_model 上落到同一个
+# infer_panel（batch_infer），避免并发改写模型属性互相干扰。
 DEFAULT_REQ = {
     "top_k": 15,
     "top_p": 1.0,
@@ -257,10 +323,65 @@ class VoiceRegistry:
             return str(PROJECT_ROOT / r)
         return str(ENGINE_DIR / r)
 
+# ----------------------------------------------------------------------------
+# TTS 引擎封装（并发版）
+# ----------------------------------------------------------------------------
+class _LockedTextPreprocessor:
+    """对共享 text_preprocessor 的调用加锁。
 
-# ----------------------------------------------------------------------------
-# TTS 引擎封装
-# ----------------------------------------------------------------------------
+    并发请求共用同一个 text_preprocessor（内部走 pyopenjtalk g2p / BERT 特征
+    提取），这些 C/模型调用并非线程安全，用一把全局锁串行化文本预处理部分；
+    文本预处理只占推理的一小部分，不影响并行的 GPU 合成主流程。
+    """
+
+    def __init__(self, inner, lock: threading.Lock):
+        self._inner = inner
+        self._lock = lock
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def preprocess(self, *args, **kwargs):
+        with self._lock:
+            return self._inner.preprocess(*args, **kwargs)
+
+    def segment_and_extract_feature_for_text(self, *args, **kwargs):
+        with self._lock:
+            return self._inner.segment_and_extract_feature_for_text(*args, **kwargs)
+
+
+class EmotionTTS(TTS):
+    """共享基础引擎模型、拥有独立 prompt_cache / stop_flag 的轻量实例。
+
+    不加载任何权重（避免重复占用显存）；每个请求用后即弃。
+    参考特征在创建时注入 prompt_cache，run() 期间不再改写共享状态。
+    """
+
+    def __init__(self, base: TTS):
+        # 复制 base 的全部实例属性（模型、配置等，均为共享引用），仅 prompt_cache /
+        # stop_flag 用本实例独立副本。不硬编码属性名：不同引擎版本（官方整合包 vs
+        # GitHub 源码）属性集合可能不同（如 sv_model 仅部分版本存在），复制 __dict__
+        # 天然兼容。run() 在推理期间只会改写 stop_flag / prompt_cache（已独立）与
+        # infer_panel / t2s_model（仅重绑定本实例，不污染共享的 base）。
+        self.configs = base.configs
+        for k, v in base.__dict__.items():
+            if k in ("configs", "prompt_cache", "stop_flag"):
+                continue
+            setattr(self, k, v)
+        self.stop_flag = False
+        self.prompt_cache = {
+            "ref_audio_path": None,
+            "prompt_semantic": None,
+            "refer_spec": [],
+            "prompt_text": None,
+            "prompt_lang": None,
+            "phones": None,
+            "bert_features": None,
+            "norm_text": None,
+            "aux_ref_audio_paths": [],
+        }
+
+
 class TTSBackend:
     def __init__(self, registry: VoiceRegistry, initial_voice_id: Optional[str],
                  device: str = "auto",
@@ -268,8 +389,12 @@ class TTSBackend:
                  bert_base_path: Optional[str] = None,
                  cnhuhbert_base_path: Optional[str] = None):
         self.registry = registry
-        self.lock = threading.RLock()
         self.default_emotion = default_emotion or DEFAULT_CONFIG["default_emotion"]
+        self.sample_rate = 48000
+
+        # 安装线程感知的 stdout 静音包装（压制引擎加载/合成的诊断噪音）
+        if not isinstance(sys.stdout, _SilentStdout):
+            sys.stdout = _SilentStdout()
 
         use_cuda = torch.cuda.is_available()
         if device == "cuda":
@@ -282,16 +407,42 @@ class TTSBackend:
             device = "cuda" if use_cuda else "cpu"
         self.device = device
         self.is_half = device == "cuda"
-        self.sample_rate = 48000
 
-        bert_base_path = bert_base_path or DEFAULT_CONFIG["bert_base_path"]
-        cnhuhbert_base_path = cnhuhbert_base_path or DEFAULT_CONFIG["cnhuhbert_base_path"]
+        self.bert_base_path = bert_base_path or DEFAULT_CONFIG["bert_base_path"]
+        self.cnhuhbert_base_path = cnhuhbert_base_path or DEFAULT_CONFIG["cnhuhbert_base_path"]
 
-        voice_id, voice = self._pick_initial(initial_voice_id)
+        self._bases: dict = {}
+        self._base_lock = threading.Lock()
+        self._ref_cache: dict = {}
+        self._ref_lock = threading.RLock()
+        self._text_lock = threading.Lock()
+
+        if initial_voice_id and not registry.get(initial_voice_id):
+            raise ValueError(f"音色不存在: {initial_voice_id}")
+        vid = self._pick_initial(initial_voice_id)
+        if registry.active() is None:
+            registry.set_active(vid)
+        voice = registry.get(vid)
+        self.engine_version = voice.get("engine", "v4") if voice else "v4"
+        print(f"[backend] 引擎就绪 device={self.device} is_half={self.is_half} "
+              f"默认音色={vid}（按需加载，流式/非流式可并发）")
+        self.prime_refs(vid)
+
+    def _pick_initial(self, requested: Optional[str]) -> str:
+        if requested and self.registry.get(requested):
+            return requested
+        active = self.registry.active()
+        if active and self.registry.get(active):
+            return active
+        if self.registry.voices():
+            return next(iter(self.registry.voices()))
+        raise RuntimeError("voices.json 中没有可用的音色，请先注册音色")
+
+    def _build_base(self, voice: dict) -> TTS:
         cfg = {
             "custom": {
-                "bert_base_path": bert_base_path,
-                "cnhuhbert_base_path": cnhuhbert_base_path,
+                "bert_base_path": self.bert_base_path,
+                "cnhuhbert_base_path": self.cnhuhbert_base_path,
                 "device": self.device,
                 "is_half": self.is_half,
                 "t2s_weights_path": self.registry.resolve(voice["gpt_path"]),
@@ -299,92 +450,79 @@ class TTSBackend:
                 "version": voice.get("engine", "v4"),
             }
         }
-        self.config = TTS_Config(cfg)
-        self.tts = TTS(self.config)
-        self.current_voice_id = voice_id
-        self._ref_cache: dict = {}
-        if self.registry.active() is None:
-            self.registry.set_active(voice_id)
-        print(f"[backend] 引擎已加载 device={self.device} is_half={self.is_half} voice={voice_id}")
+        return TTS(TTS_Config(cfg))
+
+    def _get_base(self, voice_id: str) -> TTS:
+        with self._base_lock:
+            base = self._bases.get(voice_id)
+            if base is not None:
+                return base
+            voice = self.registry.get(voice_id)
+            if not voice:
+                raise ValueError(f"音色不存在: {voice_id}")
+            err = self.registry.validate(voice)
+            if err:
+                raise ValueError(err)
+            t0 = time.time()
+            with _silence_engine():
+                base = self._build_base(voice)
+            self._bases[voice_id] = base
+            print(f"[backend] 音色 [{voice_id}] 引擎实例加载 ({(time.time()-t0):.1f}s)")
+            return base
+
+    def ensure_voice(self, voice_id: str) -> str:
+        """校验并预热音色（加载权重 + 预计算情绪参考特征），供激活/切换使用。"""
+        self._get_base(voice_id)
         self.prime_refs(voice_id)
-
-    def _pick_initial(self, requested: Optional[str]):
-        if requested and self.registry.get(requested):
-            return requested, self.registry.get(requested)
-        active = self.registry.active()
-        if active and self.registry.get(active):
-            return active, self.registry.get(active)
-        if self.registry.voices():
-            vid = next(iter(self.registry.voices()))
-            return vid, self.registry.get(vid)
-        raise RuntimeError("voices.json 中没有可用的音色，请先注册音色")
-
-    def switch_voice(self, voice_id: str) -> str:
-        if voice_id == self.current_voice_id:
-            return voice_id
-        voice = self.registry.get(voice_id)
-        if not voice:
-            raise ValueError(f"音色不存在: {voice_id}")
-        err = self.registry.validate(voice)
-        if err:
-            raise ValueError(err)
-        t0 = time.time()
-        with self.lock:
-            self.tts.init_t2s_weights(self.registry.resolve(voice["gpt_path"]))
-            self.tts.init_vits_weights(self.registry.resolve(voice["sovits_path"]))
-            self.current_voice_id = voice_id
-            self.registry.set_active(voice_id)
-        print(f"[backend] 切换音色 -> {voice_id} ({(time.time()-t0):.1f}s)")
+        self.registry.set_active(voice_id)
         return voice_id
 
     def _get_ref_features(self, voice_id: str, emotion: str, ref_wav: str,
                           prompt_text: str, prompt_lang: str) -> dict:
-        """取某情绪参考音频的已缓存特征；文件变动时重建。返回可直接注入 prompt_cache 的 dict。"""
         key = (voice_id, emotion)
         try:
             st = os.stat(ref_wav)
             mtime_sz = (st.st_mtime, st.st_size)
         except OSError:
             mtime_sz = None
-        entry = self._ref_cache.get(key)
-        if entry and entry["mtime_sz"] == mtime_sz and entry["path"] == ref_wav:
-            return entry["features"]
+        with self._ref_lock:
+            entry = self._ref_cache.get(key)
+            if entry and entry["mtime_sz"] == mtime_sz and entry["path"] == ref_wav:
+                return entry["features"]
 
-        if self.tts.prompt_cache.get("ref_audio_path") != ref_wav:
-            self.tts.set_ref_audio(ref_wav)
+            base = self._get_base(voice_id)
+            with self._text_lock:
+                with _silence_engine():
+                    if base.prompt_cache.get("ref_audio_path") != ref_wav:
+                        base.set_ref_audio(ref_wav)
+                    pt = prompt_text.strip("\n")
+                    if pt and pt[-1] not in splits:
+                        pt += "。" if prompt_lang != "en" else "."
+                    if base.prompt_cache.get("prompt_text") != pt:
+                        phones, bert_features, norm_text = (
+                            base.text_preprocessor.segment_and_extract_feature_for_text(
+                                pt, prompt_lang, base.configs.version))
+                        base.prompt_cache["prompt_text"] = pt
+                        base.prompt_cache["prompt_lang"] = prompt_lang
+                        base.prompt_cache["phones"] = phones
+                        base.prompt_cache["bert_features"] = bert_features
+                        base.prompt_cache["norm_text"] = norm_text
 
-        print(f"[refcache] 重建特征 {voice_id}/{emotion} <- {os.path.basename(ref_wav)}")
-
-        pt = prompt_text.strip("\n")
-        if pt and pt[-1] not in splits:
-            pt += "。" if prompt_lang != "en" else "."
-        if self.tts.prompt_cache.get("prompt_text") != pt:
-            phones, bert_features, norm_text = (
-                self.tts.text_preprocessor.segment_and_extract_feature_for_text(
-                    pt, prompt_lang, self.tts.configs.version
-                )
-            )
-            self.tts.prompt_cache["prompt_text"] = pt
-            self.tts.prompt_cache["prompt_lang"] = prompt_lang
-            self.tts.prompt_cache["phones"] = phones
-            self.tts.prompt_cache["bert_features"] = bert_features
-            self.tts.prompt_cache["norm_text"] = norm_text
-
-        features = {
-            "raw_audio": self.tts.prompt_cache["raw_audio"],
-            "raw_sr": self.tts.prompt_cache["raw_sr"],
-            "refer_spec": self.tts.prompt_cache["refer_spec"][:],
-            "prompt_semantic": self.tts.prompt_cache["prompt_semantic"],
-            "prompt_text": self.tts.prompt_cache["prompt_text"],
-            "prompt_lang": self.tts.prompt_cache["prompt_lang"],
-            "phones": self.tts.prompt_cache["phones"],
-            "bert_features": self.tts.prompt_cache["bert_features"],
-            "norm_text": self.tts.prompt_cache["norm_text"],
-            "ref_audio_path": self.tts.prompt_cache["ref_audio_path"],
-            "aux_ref_audio_paths": self.tts.prompt_cache["aux_ref_audio_paths"],
-        }
-        self._ref_cache[key] = {"mtime_sz": mtime_sz, "path": ref_wav, "features": features}
-        return features
+                features = {
+                    "raw_audio": base.prompt_cache["raw_audio"],
+                    "raw_sr": base.prompt_cache["raw_sr"],
+                    "refer_spec": base.prompt_cache["refer_spec"][:],
+                    "prompt_semantic": base.prompt_cache["prompt_semantic"],
+                    "prompt_text": base.prompt_cache["prompt_text"],
+                    "prompt_lang": base.prompt_cache["prompt_lang"],
+                    "phones": base.prompt_cache["phones"],
+                    "bert_features": base.prompt_cache["bert_features"],
+                    "norm_text": base.prompt_cache["norm_text"],
+                    "ref_audio_path": base.prompt_cache["ref_audio_path"],
+                    "aux_ref_audio_paths": base.prompt_cache["aux_ref_audio_paths"],
+                }
+            self._ref_cache[key] = {"mtime_sz": mtime_sz, "path": ref_wav, "features": features}
+            return features
 
     def prime_refs(self, voice_id: str):
         """启动时预计算该音色所有情绪的参考特征，消除首个请求 / 情绪切换的额外耗时。"""
@@ -415,129 +553,55 @@ class TTSBackend:
                 return cand
         return emos[0] if emos else self.default_emotion
 
-    def _prepare(self, voice_id: Optional[str], emotion: Optional[str],
-                 text: str, text_lang: str, extra: dict, streaming: bool):
-        """加锁状态下准备一次合成：切音色、解析情绪、准备参考特征、构造请求并启动生成器。
-        返回 (generator, voice_id, emotion)。调用方必须已持有 self.lock。"""
-        text = _sanitize_text(text)
-        voice_id = self.switch_voice(voice_id or self.registry.active())
-        voice = self.registry.get(voice_id)
-        emotion = self.resolve_emotion(voice, emotion)
-        ref = voice["emotions"].get(emotion)
-        if not ref:
-            raise ValueError(f"音色 [{voice_id}] 没有情绪 [{emotion}]，可选: {list(voice['emotions'].keys())}")
+    def new_instance(self, voice_id: str, features: dict) -> EmotionTTS:
+        """为单个请求创建轻量引擎实例（共享该音色权重模型，注入参考特征）。"""
+        base = self._get_base(voice_id)
+        inst = EmotionTTS(base)
+        inst.text_preprocessor = _LockedTextPreprocessor(base.text_preprocessor, self._text_lock)
+        inst.prompt_cache.update(features)
+        return inst
 
-        ref_wav = self.registry.resolve(ref["wav"])
-        features = self._get_ref_features(voice_id, emotion, ref_wav,
-                                          ref["text"], ref["lang"])
-        self.tts.prompt_cache.update(features)
-
+    def _build_req(self, text: str, text_lang: str, ref: dict, extra: dict,
+                   return_fragment: bool) -> dict:
         req = dict(DEFAULT_REQ)
         req.update(extra)
         req.update({
             "text": text,
             "text_lang": text_lang,
-            "ref_audio_path": ref_wav,
+            "ref_audio_path": self.registry.resolve(ref["wav"]),
             "prompt_text": ref["text"],
             "prompt_lang": ref["lang"],
-            "return_fragment": streaming,
+            "return_fragment": return_fragment,
         })
-        gen = self.tts.run(req)
-        return gen, voice_id, emotion
+        return req
 
-    def synthesize(self, voice_id: Optional[str], emotion: Optional[str],
-                   text: str, text_lang: str, media_type: str, extra: dict):
-        with self.lock:
-            gen, voice_id, emotion = self._prepare(
-                voice_id, emotion, text, text_lang, extra, streaming=False)
-            t0 = time.time()
-            sr, audio = next(gen)
+    def run_non_stream(self, inst: EmotionTTS, text: str, text_lang: str,
+                       ref: dict, media_type: str, extra: dict):
+        """非流式合成（在线程池中执行，实例用后即弃，可并发）。"""
+        try:
+            req = self._build_req(text, text_lang, ref, extra, return_fragment=False)
+            with _silence_engine():
+                gen = inst.run(req)
+                sr, audio = next(gen)
             audio = np.asarray(audio)
-            print(f"[tts] voice={voice_id} emotion={emotion} lang={text_lang} "
-                  f"dur={len(audio)/sr:.2f}s infer={(time.time()-t0):.2f}s")
             return pack_audio(audio, sr, media_type), sr
-
-    def synthesize_stream(self, voice_id: Optional[str], emotion: Optional[str],
-                          text: str, text_lang: str, media_type: str, extra: dict):
-        """流式合成：逐句 yield (sample_rate, audio_int16)。
-
-        全程持有 self.lock，与其它合成互斥，避免并发请求改写 prompt_cache。
-        每句已完成音频后立即产出，客户端可边收边播，显著降低首句延迟。
-        """
-        with self.lock:
-            gen, voice_id, emotion = self._prepare(
-                voice_id, emotion, text, text_lang, extra, streaming=True)
-            for sr, audio in gen:
-                audio = np.asarray(audio)
-                print(f"[tts][stream] voice={voice_id} emotion={emotion} "
-                      f"chunk={len(audio)/sr:.2f}s")
-                yield sr, audio
-
-    def cancel_stream(self):
-        """终止当前流式合成。
-
-        引擎在完成正在合成的当前句后停止（句级抢占），已产出的音频
-        仍正常下发，流式请求随后正常结束。
-        """
-        if self.tts is not None:
-            self.tts.stop_flag = True
-
-
-# ----------------------------------------------------------------------------
-# 顺序合成队列
-# ----------------------------------------------------------------------------
-class _SynthJob:
-    __slots__ = ("fut", "voice_id", "emotion", "text", "text_lang",
-                 "media_type", "extra")
-
-
-class SynthesisQueue:
-    """FIFO 顺序合成队列。
-
-    请求按提交顺序逐条处理（单 worker），保证「一句话接着一句话」。
-    合成在后台线程进行，事件循环不阻塞；任何异常只影响当次请求，
-    队列继续处理后续任务。
-    """
-
-    def __init__(self, backend: TTSBackend, loop: asyncio.AbstractEventLoop):
-        self.backend = backend
-        self.loop = loop
-        self._q: Queue = Queue()
-        self._worker = threading.Thread(target=self._run, name="synth-worker",
-                                        daemon=True)
-        self._worker.start()
-
-    def _run(self):
-        while True:
-            job = self._q.get()
+        finally:
             try:
-                data, sr = self.backend.synthesize(
-                    job.voice_id, job.emotion, job.text, job.text_lang,
-                    job.media_type, job.extra)
-                self.loop.call_soon_threadsafe(job.fut.set_result, (data, sr))
-            except Exception as e:
-                traceback.print_exc()
-                self.loop.call_soon_threadsafe(job.fut.set_exception, e)
-            finally:
-                self._q.task_done()
+                del inst
+            except Exception:
+                pass
 
-    def submit(self, voice_id: Optional[str], emotion: str, text: str,
-               text_lang: str, media_type: str, extra: dict) -> asyncio.Future:
-        job = _SynthJob()
-        job.fut = self.loop.create_future()
-        job.voice_id = voice_id
-        job.emotion = emotion
-        job.text = text
-        job.text_lang = text_lang
-        job.media_type = media_type
-        job.extra = extra
-        self._q.put(job)
-        return job.fut
+    def run_stream(self, inst: EmotionTTS, req: dict, emotion: str):
+        """流式合成：逐句 yield (sample_rate, audio_int16)。"""
+        for sr, audio in inst.run(req):
+            yield sr, np.asarray(audio)
 
-    @property
-    def pending(self) -> int:
-        return self._q.qsize()
-
+    def cancel_instance(self, inst: EmotionTTS):
+        """句级终止指定实例的流式合成（当前句结束后返回）。"""
+        try:
+            inst.stop_flag = True
+        except Exception:
+            pass
 
 # ----------------------------------------------------------------------------
 # FastAPI 应用
@@ -552,22 +616,14 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
         allow_headers=["*"],
     )
 
-    synth_queue: Optional[SynthesisQueue] = None
+    active = {"lock": threading.Lock(), "streams": {}}
 
-    active = {"cancel": None}
-
-    def _cancel_active_stream():
-        """终止正在进行的流式合成（若有），供新请求抢占。"""
-        fn = active.get("cancel")
-        if fn:
-            active["cancel"] = None
-            fn()
-
-    @app.on_event("startup")
-    def _startup():
-        nonlocal synth_queue
-        synth_queue = SynthesisQueue(backend, asyncio.get_running_loop())
-        print("[backend] 合成队列已启动 (FIFO 顺序合成)")
+    def _stop_all_streams():
+        """终止所有在途的流式请求（句级抢占，供 stop_prev 使用）。"""
+        with active["lock"]:
+            streams = list(active["streams"].values())
+        for inst in streams:
+            backend.cancel_instance(inst)
 
     class TTSRequest(BaseModel):
         text: str
@@ -576,6 +632,7 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
         emotion: Optional[str] = None
         media_type: str = "wav"
         streaming: bool = False
+        stop_prev: bool = False
         speed_factor: float = 1.0
         top_k: int = 15
         top_p: float = 1.0
@@ -585,6 +642,8 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
 
     @app.get("/health")
     async def health():
+        with active["lock"]:
+            n_streams = len(active["streams"])
         return {
             "code": 0,
             "message": "ok",
@@ -593,10 +652,11 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                 "device": backend.device,
                 "is_half": backend.is_half,
                 "cuda": torch.cuda.is_available(),
-                "engine_version": backend.config.version,
+                "engine_version": backend.engine_version,
                 "active_voice": registry.active(),
                 "voice_count": len(registry.voices()),
-                "queue_pending": synth_queue.pending if synth_queue else 0,
+                "active_streams": n_streams,
+                "concurrency": "per-request-instance",
             },
         }
 
@@ -625,13 +685,13 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
     @app.post("/voices/{voice_id}/activate")
     async def activate_voice(voice_id: str):
         try:
-            backend.switch_voice(voice_id)
+            backend.ensure_voice(voice_id)
         except (ValueError, RuntimeError) as e:
             return JSONResponse(status_code=400, content={"code": 400, "message": str(e)})
         return {"code": 0, "message": "ok", "data": {"voice_id": voice_id, "device": backend.device}}
 
     @app.post("/tts")
-    async def tts(req: TTSRequest):
+    async def tts(req: TTSRequest, request: Request):
         text = _sanitize_text(req.text)
         if not text.strip():
             return JSONResponse(status_code=400, content={"code": 400, "message": "text 不能为空"})
@@ -642,6 +702,29 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
             return JSONResponse(status_code=400,
                                 content={"code": 400, "message": f"media_type 不支持: {req.media_type}"})
         try:
+            voice_id = req.voice_id or registry.active()
+            voice = registry.get(voice_id)
+            if not voice:
+                raise ValueError(f"音色不存在: {voice_id}")
+            emotion = backend.resolve_emotion(voice, req.emotion)
+            ref = voice["emotions"].get(emotion)
+            if not ref:
+                # 请求的情绪不存在：回退到默认情绪链（音色 default_emotion >
+                # 全局 default_emotion > 该音色第一个情绪）
+                fallback = backend.resolve_emotion(voice, None)
+                print(f"[tts] 情绪 [{emotion}] 不存在，回退到 [{fallback}]")
+                emotion = fallback
+                ref = voice["emotions"].get(emotion)
+                if not ref:
+                    raise ValueError(f"音色 [{voice_id}] 没有可用情绪，可选: {list(voice['emotions'].keys())}")
+
+            mode = "流式" if req.streaming else "合成"
+            shown = text if len(text) <= 60 else text[:60] + "…"
+            print(f"[tts] [{mode}] {voice_id}/{emotion} ({req.text_lang}): {shown}")
+
+            ref_wav = registry.resolve(ref["wav"])
+            features = backend._get_ref_features(voice_id, emotion, ref_wav,
+                                                 ref["text"], ref["lang"])
             extra = {
                 "speed_factor": float(req.speed_factor),
                 "top_k": int(req.top_k),
@@ -650,40 +733,45 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                 "seed": int(req.seed),
                 "repetition_penalty": float(req.repetition_penalty),
             }
+
             if req.streaming:
                 if req.media_type not in ("wav", "raw"):
                     return JSONResponse(status_code=400, content={
                         "code": 400,
                         "message": f"streaming 仅支持 wav / raw，不支持 {req.media_type}"})
 
-                _cancel_active_stream()
+                if req.stop_prev:
+                    _stop_all_streams()
+
+                inst = backend.new_instance(voice_id, features)
+                rid = id(inst)
+                with active["lock"]:
+                    active["streams"][rid] = inst
+                body = backend._build_req(text, req.text_lang, ref, extra, return_fragment=True)
                 aq: asyncio.Queue = asyncio.Queue()
-
-                def cancel_fn():
-                    backend.cancel_stream()
-
-                active["cancel"] = cancel_fn
 
                 def producer():
                     try:
-                        for sr, audio in backend.synthesize_stream(
-                                req.voice_id, req.emotion, text, req.text_lang,
-                                req.media_type, extra):
-                            if audio.size and not audio.any():
-                                continue  # 引擎停止/出错时的静音段，不下发
-                            aq.put_nowait((sr, pack_audio(audio, sr, req.media_type)))
+                        with _silence_engine():
+                            for sr, audio in backend.run_stream(inst, body, emotion):
+                                if audio.size and not audio.any():
+                                    continue  # 引擎停止/出错时的静音段，不下发
+                                aq.put_nowait((sr, pack_audio(audio, sr, req.media_type)))
                         aq.put_nowait(None)
                     except Exception as e:
                         aq.put_nowait(e)
+                    finally:
+                        # 注意：不要对 inst 做任何赋值/del（否则会把 inst 变成 producer
+                        # 的局部变量，导致上方 run_stream(inst, ...) 抛 UnboundLocalError）。
+                        # 线程结束后 run_stream 生成器被回收，inst 随之释放。
+                        with active["lock"]:
+                            active["streams"].pop(rid, None)
 
                 threading.Thread(target=producer, daemon=True).start()
                 first = await aq.get()
                 if first is None:
-                    active["cancel"] = None
                     return Response(content=b"", media_type=MEDIA_MIME[req.media_type])
                 if isinstance(first, Exception):
-                    if active.get("cancel") is cancel_fn:
-                        active["cancel"] = None
                     if isinstance(first, (ValueError, RuntimeError, FileNotFoundError)):
                         return JSONResponse(status_code=400, content={"code": 400, "message": str(first)})
                     traceback.print_exc()
@@ -700,19 +788,37 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                                 break
                             yield item[1]
                     finally:
-                        # 正常结束：清注册；客户端断开：终止后台合成，尽快释放合成锁
-                        if active.get("cancel") is cancel_fn:
-                            active["cancel"] = None
-                            cancel_fn()
+                        # 正常结束：清注册；客户端断开：终止后台合成，尽快释放实例
+                        backend.cancel_instance(inst)
 
                 return StreamingResponse(stream(), media_type=MEDIA_MIME[req.media_type],
                                          headers=headers)
 
-            _cancel_active_stream()
-            fut = synth_queue.submit(req.voice_id, req.emotion,
-                                     text, req.text_lang,
-                                     req.media_type, extra)
-            data, sr = await fut
+            if req.stop_prev:
+                _stop_all_streams()
+            inst = backend.new_instance(voice_id, features)
+            task = asyncio.create_task(asyncio.to_thread(
+                backend.run_non_stream, inst, text, req.text_lang,
+                ref, req.media_type, extra))
+            try:
+                while True:
+                    done, _ = await asyncio.wait({task}, timeout=0.5)
+                    if done:
+                        break
+                    if await request.is_disconnected():
+                        # 客户端断开：句级取消合成，避免孤儿请求继续占 GPU
+                        print(f"[tts] 客户端断开，取消合成 ({voice_id}/{emotion})")
+                        backend.cancel_instance(inst)
+                        try:
+                            await asyncio.wait_for(task, timeout=30)
+                        except asyncio.TimeoutError:
+                            task.cancel()  # 线程无法强杀，但 stop_flag 已置位，会尽快退出
+                        return Response(content=b"", status_code=499,
+                                        media_type=MEDIA_MIME[req.media_type])
+                data, sr = task.result()
+            except asyncio.CancelledError:
+                backend.cancel_instance(inst)
+                raise
             return Response(content=data, media_type=MEDIA_MIME[req.media_type])
         except (ValueError, RuntimeError, FileNotFoundError) as e:
             return JSONResponse(status_code=400, content={"code": 400, "message": str(e)})
@@ -726,7 +832,46 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
 # ----------------------------------------------------------------------------
 # 入口
 # ----------------------------------------------------------------------------
+if sys.platform == "win32":
+    import ctypes
+
+    class _PowerThrottling(ctypes.Structure):
+        _fields_ = [("Version", ctypes.c_uint32),
+                    ("ControlMask", ctypes.c_uint32),
+                    ("StateMask", ctypes.c_uint32)]
+
+
+def _apply_windows_perf_boost():
+    """Windows 下静默防止窗口最小化/后台时被系统功耗节流而降速。
+
+    实测（RTX4090）：窗口后台时合成慢约 2 倍（GPU 利用率仅 ~40%），
+    关掉 ExecutionSpeed 功耗节流 + 禁用 priority boost + 提到 AboveNormal 后
+    后台性能恢复到接近前台。仅对当前进程生效（进程退出即自动还原系统原本设定，
+    不会持久改变 Windows 设置）。失败不影响启动，全部静默处理。
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        k32 = ctypes.windll.kernel32
+        h = k32.GetCurrentProcess()
+        k32.SetProcessInformation.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                              ctypes.c_void_p, ctypes.c_uint32]
+        k32.SetProcessInformation.restype = ctypes.c_bool
+        k32.SetProcessPriorityBoost.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+        k32.SetProcessPriorityBoost.restype = ctypes.c_bool
+        k32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        k32.SetPriorityClass.restype = ctypes.c_bool
+
+        st = _PowerThrottling(1, 1, 0)  # PROCESS_POWER_THROTTLING_EXECUTION_SPEED = 1，置 0 即禁用
+        k32.SetProcessInformation(h, 4, ctypes.byref(st), ctypes.sizeof(st))
+        k32.SetProcessPriorityBoost(h, True)
+        k32.SetPriorityClass(h, 0x00008000)  # ABOVE_NORMAL_PRIORITY_CLASS
+    except Exception:
+        pass
+
+
 def main():
+    _apply_windows_perf_boost()
     cfg = load_server_config()
     parser = argparse.ArgumentParser(description="TTS 本地服务 (GPT-SoVITS V4)")
     parser.add_argument("-a", "--host", type=str, default=None)
@@ -750,13 +895,17 @@ def main():
 
     print("=" * 60)
     print(f"  TTS 本地服务  http://{host}:{port}")
-    print(f"  设备: {backend.device}  半精度: {backend.is_half}  引擎: {backend.config.version}")
+    print(f"  设备: {backend.device}  半精度: {backend.is_half}  引擎: {backend.engine_version}")
     print(f"  默认情绪: {backend.default_emotion}（请求未指定时使用；可按音色在 voices.json 覆盖）")
     print(f"  接口: GET /health | GET /voices | POST /voices/{{id}}/activate | POST /tts")
-    print("  队列: FIFO 顺序合成（请求按提交顺序逐条处理）")
-    print(f"  配置: server_config.json{'（已加载）' if cfg else '（不存在，使用默认值）'}")
+    print("  并发: 每请求独立轻量引擎实例，流式/非流式可并行；stop_prev 可句级抢占在途流式请求")
     print("=" * 60)
-    uvicorn.run(app, host=host, port=port, workers=1)
+    # log_level=warning：去掉 uvicorn 的逐请求访问日志，保留错误/警告
+    try:
+        uvicorn.run(app, host=host, port=port, workers=1, log_level="warning")
+        print("\n[TTS] 服务已正常退出")
+    except KeyboardInterrupt:
+        print("\n[TTS] 服务已正常退出（Ctrl+C）")
 
 
 if __name__ == "__main__":
