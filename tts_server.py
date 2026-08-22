@@ -179,6 +179,33 @@ DEFAULT_CONFIG = {
     "cnhuhbert_base_path": "GPT_SoVITS/pretrained_models/chinese-hubert-base",
 }
 
+# 各引擎版本的底模（未指定音色 LoRA 时回退使用）。路径相对 engine/ 目录。
+_BASE_MODELS = {
+    "v1": ("GPT_SoVITS/pretrained_models/s1bert25hz-2kh-longer-epoch=68e-step=50232.ckpt",
+           "GPT_SoVITS/pretrained_models/s2G488k.pth"),
+    "v2": ("GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s1bert25hz-5kh-longer-epoch=12-step=369668.ckpt",
+           "GPT_SoVITS/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth"),
+    "v3": ("GPT_SoVITS/pretrained_models/s1v3.ckpt",
+           "GPT_SoVITS/pretrained_models/s2Gv3.pth"),
+    "v4": ("GPT_SoVITS/pretrained_models/s1v3.ckpt",
+           "GPT_SoVITS/pretrained_models/gsv-v4-pretrained/s2Gv4.pth"),
+}
+
+
+def _resolve_voice_weights(registry, voice: dict) -> tuple:
+    """解析音色实际使用的 GPT / VITS 权重路径。
+
+    gpt_path / sovits_path 任一未指定（字段为空）时，回退到该引擎版本的底模；
+    已指定则用指定路径（由调用方校验其存在性）。
+    """
+    version = voice.get("engine", "v4")
+    base_gpt, base_vits = _BASE_MODELS.get(version, _BASE_MODELS["v4"])
+    gpt_spec = (voice.get("gpt_path") or "").strip()
+    sovits_spec = (voice.get("sovits_path") or "").strip()
+    gpt_path = registry.resolve(gpt_spec) if gpt_spec else registry.resolve(base_gpt)
+    vits_path = registry.resolve(sovits_spec) if sovits_spec else registry.resolve(base_vits)
+    return gpt_path, vits_path
+
 
 def load_server_config() -> dict:
     """读取项目根目录 server_config.json（用户可编辑）；缺失/损坏时返回 {}。"""
@@ -333,12 +360,11 @@ class VoiceRegistry:
         return self.voices().get(voice_id)
 
     def validate(self, voice: dict) -> Optional[str]:
-        gpt = voice.get("gpt_path", "")
-        sovits = voice.get("sovits_path", "")
-        if not gpt or not os.path.isfile(self.resolve(gpt)):
-            return f"gpt_path 不存在: {gpt}"
-        if not sovits or not os.path.isfile(self.resolve(sovits)):
-            return f"sovits_path 不存在: {sovits}"
+        gpt_path, vits_path = _resolve_voice_weights(self, voice)
+        if not os.path.isfile(gpt_path):
+            return f"GPT 权重不存在（LoRA 或底模）: {gpt_path}"
+        if not os.path.isfile(vits_path):
+            return f"VITS 权重不存在（LoRA 或底模）: {vits_path}"
         emotions = voice.get("emotions", {})
         if not isinstance(emotions, dict):
             return "emotions 必须是对象"
@@ -476,14 +502,15 @@ class TTSBackend:
         raise RuntimeError("voices.json 中没有可用的音色，请先注册音色")
 
     def _build_base(self, voice: dict) -> TTS:
+        gpt_path, vits_path = _resolve_voice_weights(self.registry, voice)
         cfg = {
             "custom": {
                 "bert_base_path": self.bert_base_path,
                 "cnhuhbert_base_path": self.cnhuhbert_base_path,
                 "device": self.device,
                 "is_half": self.is_half,
-                "t2s_weights_path": self.registry.resolve(voice["gpt_path"]),
-                "vits_weights_path": self.registry.resolve(voice["sovits_path"]),
+                "t2s_weights_path": gpt_path,
+                "vits_weights_path": vits_path,
                 "version": voice.get("engine", "v4"),
             }
         }
@@ -501,10 +528,14 @@ class TTSBackend:
             if err:
                 raise ValueError(err)
             t0 = time.time()
+            gpt_path, vits_path = _resolve_voice_weights(self.registry, voice)
+            gpt_src = "LoRA" if (voice.get("gpt_path") or "").strip() else "底模"
+            vits_src = "LoRA" if (voice.get("sovits_path") or "").strip() else "底模"
             with _silence_engine():
                 base = self._build_base(voice)
             self._bases[voice_id] = base
-            print(f"[backend] 音色 [{voice_id}] 引擎实例加载 ({(time.time()-t0):.1f}s)")
+            print(f"[backend] 音色 [{voice_id}] 引擎实例加载 ({(time.time()-t0):.1f}s) "
+                  f"GPT={gpt_src} VITS={vits_src}")
             return base
 
     def ensure_voice(self, voice_id: str) -> str:
@@ -706,6 +737,8 @@ def create_app(backend: TTSBackend, registry: VoiceRegistry) -> FastAPI:
                 "engine": v.get("engine", "v4"),
                 "gpt_path": v.get("gpt_path"),
                 "sovits_path": v.get("sovits_path"),
+                "gpt_base_model": not (v.get("gpt_path") or "").strip(),
+                "vits_base_model": not (v.get("sovits_path") or "").strip(),
                 "default_emotion": backend.resolve_emotion(v, None),
                 "emotions": {
                     emo: {

@@ -163,6 +163,12 @@ POST /tts
 `gpt_path` / `sovits_path` / `wav` 为相对路径：优先在项目根目录下解析；若不存在
 则回退到 `engine/` 下解析。
 
+**`gpt_path` / `sovits_path` 均为可选**：任一字段缺省（不写或留空）时，该部分自动
+使用对应引擎版本的**底模**（v4 = `s1v3.ckpt` + `gsv-v4-pretrained/s2Gv4.pth`）。
+因此可以只给参考音频、不提供训练 LoRA 就创建「零样本音色」——音色由参考音频控制，
+无需任何训练。两个字段都可缺省（纯底模），也可只缺省其一（如只用 GPT 底模 + 自定义
+VITS LoRA）。`/voices` 接口会返回 `gpt_base_model` / `vits_base_model` 标明实际来源。
+
 内置的 `default` 音色是**零样本预训练音色**（无需训练），其 `gpt_path` /
 `sovits_path` 直接指向引擎内置底模，路径明确写为 `engine/GPT_SoVITS/pretrained_models/...`
 （`engine/` 即整合包所在目录），一眼可辨，不会与项目根目录下的自定义权重混淆。
